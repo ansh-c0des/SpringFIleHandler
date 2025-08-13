@@ -7,8 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 
 @Service
 public class ExcelService {
@@ -19,12 +18,11 @@ public class ExcelService {
 
             int sheetCount = workbook.getNumberOfSheets();
             List<String> sheetNames = new ArrayList<>();
-
             for (int i = 0; i < sheetCount; i++) {
                 sheetNames.add(workbook.getSheetName(i));
             }
 
-            // Decide which sheet to read
+            // Select the target sheet
             Sheet sheetToRead;
             if (sheetCount == 1) {
                 sheetToRead = workbook.getSheetAt(0);
@@ -35,18 +33,36 @@ public class ExcelService {
                 }
             }
 
-            // Read sheet data into a list of lists
-            List<List<String>> sheetData = new ArrayList<>();
+            // Determine max column count
+            int maxColumns = 0;
             for (Row row : sheetToRead) {
-                List<String> rowData = new ArrayList<>();
-                for (Cell cell : row) {
-                    cell.setCellType(CellType.STRING); // force text for simplicity
-                    rowData.add(cell.getStringCellValue());
+                if (row.getLastCellNum() > maxColumns) {
+                    maxColumns = row.getLastCellNum();
                 }
-                sheetData.add(rowData);
             }
 
-            return new ExcelInfoResponse(sheetCount, sheetNames, sheetData);
+            // Create column-wise data
+            Map<String, List<String>> columnData = new LinkedHashMap<>();
+            for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
+                String colName = "Column " + (char) ('A' + colIndex);
+                List<String> colValues = new ArrayList<>();
+
+                for (int rowIndex = 0; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
+                    Row row = sheetToRead.getRow(rowIndex);
+                    if (row == null) {
+                        colValues.add("");
+                        continue;
+                    }
+
+                    Cell cell = row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                    cell.setCellType(CellType.STRING);
+                    colValues.add(cell.getStringCellValue());
+                }
+
+                columnData.put(colName, colValues);
+            }
+
+            return new ExcelInfoResponse(sheetCount, sheetNames, columnData);
         }
     }
 }
