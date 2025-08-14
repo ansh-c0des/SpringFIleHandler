@@ -32,6 +32,7 @@ public class ExcelService {
                 sheetNames.add(workbook.getSheetName(i));
             }
 
+            // Pick correct sheet (Data if >1, otherwise first)
             Sheet sheetToRead = (sheetCount == 1)
                     ? workbook.getSheetAt(0)
                     : workbook.getSheet("Data");
@@ -39,6 +40,7 @@ public class ExcelService {
                 throw new Exception("Sheet named 'Data' not found in the workbook");
             }
 
+            // Header row
             Row headerRow = sheetToRead.getRow(0);
             if (headerRow == null) {
                 throw new Exception("No header row found in sheet");
@@ -46,30 +48,39 @@ public class ExcelService {
 
             Map<String, List<String>> columnData = new LinkedHashMap<>();
             List<String> errors = new ArrayList<>();
-            Map<String, ColumnValidationRule> rules = validationConfig.getValidations();
 
-            // Collect actual header names
-            Set<String> actualHeaders = new HashSet<>();
-            for (Cell cell : headerRow) {
-                actualHeaders.add(cell.toString().trim());
+            // Load rules and required columns from config
+            Map<String, ColumnValidationRule> rules = validationConfig.getValidations();
+            List<String> requiredColsFromConfig = validationConfig.getRequiredColumns();
+
+            // Build normalized header set for lookup (normalize: replace '_' with ' ', trim, lowercase)
+            Set<String> normalizedHeaders = new HashSet<>();
+            int headerCellCount = headerRow.getLastCellNum();
+            for (int ci = 0; ci < headerCellCount; ci++) {
+                Cell hc = headerRow.getCell(ci, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                String headerName = hc.toString().trim();
+                String normalized = normalizeForCompare(headerName);
+                normalizedHeaders.add(normalized);
             }
 
-            // 1️⃣ Check for missing required columns
-            for (Map.Entry<String, ColumnValidationRule> entry : rules.entrySet()) {
-                String expectedCol = entry.getKey().replace("_", " "); // match Excel header style
-                ColumnValidationRule rule = entry.getValue();
-
-                if (rule.isRequired() && !actualHeaders.contains(expectedCol)) {
-                    errors.add("Missing required column: " + expectedCol);
+            // 1) Check required columns presence (configurable)
+            if (requiredColsFromConfig != null) {
+                for (String required : requiredColsFromConfig) {
+                    if (required == null || required.trim().isEmpty()) continue;
+                    String reqNorm = normalizeForCompare(required);
+                    if (!normalizedHeaders.contains(reqNorm)) {
+                        // keep original text from config in message for clarity
+                        errors.add("Missing required column: " + required);
+                    }
                 }
             }
 
-            // If required column(s) missing, return immediately
+            // If required columns missing, return early (no further data reading)
             if (!errors.isEmpty()) {
                 return new ExcelInfoResponse(sheetCount, sheetNames, columnData, errors);
             }
 
-            // 2️⃣ Read and validate each column
+            // 2) Read columns and validate rows (lookup rules by header -> propertyKey with underscores)
             int maxColumns = headerRow.getLastCellNum();
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
@@ -79,8 +90,9 @@ public class ExcelService {
                 }
 
                 List<String> colValues = new ArrayList<>();
+                // property key uses underscores as in application.properties: "Joining_Date"
                 String propertyKey = colName.replace(" ", "_");
-                ColumnValidationRule rule = rules.get(propertyKey);
+                ColumnValidationRule rule = (rules == null) ? null : rules.get(propertyKey);
 
                 for (int rowIndex = 1; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
@@ -88,7 +100,7 @@ public class ExcelService {
                             ? null
                             : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
 
-                    String value = (cell == null) ? "" : cell.toString().trim();
+                    String value = (cell == null) ? "" : getCellString(cell).trim();
                     colValues.add(value);
 
                     if (rule != null) {
@@ -103,6 +115,57 @@ public class ExcelService {
         }
     }
 
+    // Normalization helper: convert underscores to spaces, trim, lower-case to compare flexibly
+    private String normalizeForCompare(String s) {
+        if (s == null) return "";
+        return s.replace('_', ' ').trim().toLowerCase();
+    }
+
+    // Convert cell to string, handling dates/numerics properly
+    private String getCellString(Cell cell) {
+        if (cell == null) return "";
+        switch (cell.getCellType()) {
+            case STRING:
+                return cell.getStringCellValue();
+            case NUMERIC:
+                if (DateUtil.isCellDateFormatted(cell)) {
+                    // default formatting for numeric date cells; doesn't validate format here
+                    return new SimpleDateFormat("dd/MM/yyyy").format(cell.getDateCellValue());
+                } else {
+                    // remove trailing .0 for integer-like values
+                    double d = cell.getNumericCellValue();
+                    if (d == Math.floor(d)) {
+                        return String.valueOf((long) d);
+                    } else {
+                        return String.valueOf(d);
+                    }
+                }
+            case BOOLEAN:
+                return String.valueOf(cell.getBooleanCellValue());
+            case FORMULA:
+                // evaluate formula result as string where possible
+                try {
+                    FormulaEvaluator evaluator = cell.getSheet().getWorkbook().getCreationHelper().createFormulaEvaluator();
+                    CellValue evaluated = evaluator.evaluate(cell);
+                    if (evaluated == null) return "";
+                    switch (evaluated.getCellType()) {
+                        case STRING: return evaluated.getStringValue();
+                        case NUMERIC:
+                            double dn = evaluated.getNumberValue();
+                            if (dn == Math.floor(dn)) return String.valueOf((long) dn);
+                            return String.valueOf(dn);
+                        case BOOLEAN: return String.valueOf(evaluated.getBooleanValue());
+                        default: return "";
+                    }
+                } catch (Exception e) {
+                    return cell.getCellFormula();
+                }
+            case BLANK:
+            default:
+                return "";
+        }
+    }
+
     private void validateCell(String value, ColumnValidationRule rule, int rowNum,
                                String colName, List<String> errors) {
         // Required check
@@ -114,7 +177,8 @@ public class ExcelService {
         // Skip further checks if empty and not required
         if (value == null || value.isEmpty()) return;
 
-        switch (rule.getType().toLowerCase()) {
+        String type = (rule.getType() == null) ? "" : rule.getType().toLowerCase(Locale.ROOT);
+        switch (type) {
             case "number":
                 try {
                     double num = Double.parseDouble(value);
@@ -131,8 +195,10 @@ public class ExcelService {
 
             case "date":
                 try {
-                    new SimpleDateFormat(rule.getFormat()).parse(value);
-                } catch (ParseException e) {
+                    SimpleDateFormat sdf = new SimpleDateFormat(rule.getFormat());
+                    sdf.setLenient(false);
+                    sdf.parse(value);
+                } catch (Exception e) {
                     errors.add("Row " + rowNum + ": " + colName + " must match date format " + rule.getFormat());
                 }
                 break;
@@ -141,6 +207,9 @@ public class ExcelService {
                 if (rule.getRegex() != null && !value.matches(rule.getRegex())) {
                     errors.add("Row " + rowNum + ": " + colName + " format is invalid");
                 }
+                break;
+
+            default:
                 break;
         }
     }
