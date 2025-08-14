@@ -18,21 +18,35 @@ public class ExcelUploadController {
         this.excelService = excelService;
     }
 
+    /**
+     * Accepts either .xlsx or .json file.
+     * - .xlsx -> validated as before
+     * - .json -> validated using same rules (JSON can be array of objects or object-of-arrays)
+     */
     @PostMapping("/upload")
-    public ResponseEntity<?> uploadExcelFile(@RequestParam("file") MultipartFile file) {
+    public ResponseEntity<?> uploadExcelOrJson(@RequestParam("file") MultipartFile file) {
         if (file.isEmpty()) {
             return ResponseEntity.badRequest().body("File is empty");
         }
 
         String filename = file.getOriginalFilename();
-        if (filename == null || !filename.endsWith(".xlsx")) {
-            return ResponseEntity.badRequest().body("Only .xlsx files are supported");
+        if (filename == null) {
+            return ResponseEntity.badRequest().body("File must have a name/extension");
         }
 
+        String lower = filename.toLowerCase();
         try {
-            ExcelInfoResponse response = excelService.extractExcelInfo(file);
+            ExcelInfoResponse response;
+            if (lower.endsWith(".xlsx")) {
+                response = excelService.extractExcelInfo(file);
+            } else if (lower.endsWith(".json")) {
+                response = excelService.extractJsonInfo(file);
+            } else {
+                return ResponseEntity.badRequest().body("Only .xlsx and .json files are supported");
+            }
             return ResponseEntity.ok(response);
         } catch (Exception e) {
+            // Return 500 with message; validation errors are returned in response.errors (200)
             return ResponseEntity.status(500).body("Error processing file: " + e.getMessage());
         }
     }

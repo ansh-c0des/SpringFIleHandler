@@ -3,13 +3,14 @@ package com.Truboard.ExcelFileDetector.service;
 import com.Truboard.ExcelFileDetector.DTO.ColumnValidationRule;
 import com.Truboard.ExcelFileDetector.DTO.ExcelInfoResponse;
 import com.Truboard.ExcelFileDetector.config.ExcelValidationConfig;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
-import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
@@ -17,11 +18,15 @@ import java.util.*;
 public class ExcelService {
 
     private final ExcelValidationConfig validationConfig;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     public ExcelService(ExcelValidationConfig validationConfig) {
         this.validationConfig = validationConfig;
     }
 
+    /**
+     * Existing Excel processing (unchanged behavior except refactored process step).
+     */
     public ExcelInfoResponse extractExcelInfo(MultipartFile file) throws Exception {
         try (InputStream inputStream = file.getInputStream();
              Workbook workbook = new XSSFWorkbook(inputStream)) {
@@ -46,41 +51,8 @@ public class ExcelService {
                 throw new Exception("No header row found in sheet");
             }
 
+            // Build columnData: Map<HeaderName, List<rowValues>>
             Map<String, List<String>> columnData = new LinkedHashMap<>();
-            List<String> errors = new ArrayList<>();
-
-            // Load rules and required columns from config
-            Map<String, ColumnValidationRule> rules = validationConfig.getValidations();
-            List<String> requiredColsFromConfig = validationConfig.getRequiredColumns();
-
-            // Build normalized header set for lookup (normalize: replace '_' with ' ', trim, lowercase)
-            Set<String> normalizedHeaders = new HashSet<>();
-            int headerCellCount = headerRow.getLastCellNum();
-            for (int ci = 0; ci < headerCellCount; ci++) {
-                Cell hc = headerRow.getCell(ci, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                String headerName = hc.toString().trim();
-                String normalized = normalizeForCompare(headerName);
-                normalizedHeaders.add(normalized);
-            }
-
-            // 1) Check required columns presence (configurable)
-            if (requiredColsFromConfig != null) {
-                for (String required : requiredColsFromConfig) {
-                    if (required == null || required.trim().isEmpty()) continue;
-                    String reqNorm = normalizeForCompare(required);
-                    if (!normalizedHeaders.contains(reqNorm)) {
-                        // keep original text from config in message for clarity
-                        errors.add("Missing required column: " + required);
-                    }
-                }
-            }
-
-            // If required columns missing, return early (no further data reading)
-            if (!errors.isEmpty()) {
-                return new ExcelInfoResponse(sheetCount, sheetNames, columnData, errors);
-            }
-
-            // 2) Read columns and validate rows (lookup rules by header -> propertyKey with underscores)
             int maxColumns = headerRow.getLastCellNum();
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
@@ -90,35 +62,151 @@ public class ExcelService {
                 }
 
                 List<String> colValues = new ArrayList<>();
-                // property key uses underscores as in application.properties: "Joining_Date"
-                String propertyKey = colName.replace(" ", "_");
-                ColumnValidationRule rule = (rules == null) ? null : rules.get(propertyKey);
-
                 for (int rowIndex = 1; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
                     Cell cell = (row == null)
                             ? null
                             : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-
                     String value = (cell == null) ? "" : getCellString(cell).trim();
                     colValues.add(value);
-
-                    if (rule != null) {
-                        validateCell(value, rule, rowIndex + 1, colName, errors);
-                    }
                 }
-
                 columnData.put(colName, colValues);
             }
 
-            return new ExcelInfoResponse(sheetCount, sheetNames, columnData, errors);
+            // Delegate to common validation/response builder
+            return processDataAndValidate(columnData, sheetCount, sheetNames);
         }
+    }
+
+    /**
+     * New: process a JSON file upload. Accepts two JSON shapes:
+     * 1) Array of objects: [ { "Name": "John", "Age": 25 }, { ... } ]
+     * 2) Object of arrays: { "Name": ["John","Alice"], "Age":[25,30] }
+     */
+    public ExcelInfoResponse extractJsonInfo(MultipartFile file) throws Exception {
+        try (InputStream in = file.getInputStream()) {
+            // Try array-of-objects first
+            try {
+                List<Map<String, Object>> rows = objectMapper.readValue(in, new TypeReference<List<Map<String, Object>>>() {});
+                if (rows == null) rows = Collections.emptyList();
+
+                // Build columnData from rows (columns discovered from keys)
+                LinkedHashMap<String, List<String>> columnData = new LinkedHashMap<>();
+                // preserve order: first collect keys in order of appearance across rows
+                LinkedHashSet<String> keysOrder = new LinkedHashSet<>();
+                for (Map<String, Object> row : rows) {
+                    if (row == null) continue;
+                    keysOrder.addAll(row.keySet());
+                }
+                for (String key : keysOrder) {
+                    columnData.put(key, new ArrayList<>());
+                }
+
+                for (Map<String, Object> row : rows) {
+                    for (String key : keysOrder) {
+                        Object val = (row == null) ? null : row.get(key);
+                        columnData.get(key).add(val == null ? "" : String.valueOf(val));
+                    }
+                }
+
+                // sheetCount = 1, name "JSON"
+                return processDataAndValidate(columnData, 1, Collections.singletonList("JSON"));
+            } catch (Exception eArray) {
+                // reset stream to try second format - need to reopen stream
+            }
+        }
+
+        // second attempt: map of arrays
+        try (InputStream in2 = file.getInputStream()) {
+            Map<String, List<Object>> cols = objectMapper.readValue(in2, new TypeReference<Map<String, List<Object>>>() {});
+            if (cols == null) cols = Collections.emptyMap();
+
+            LinkedHashMap<String, List<String>> columnData = new LinkedHashMap<>();
+            int maxRows = 0;
+            for (Map.Entry<String, List<Object>> e : cols.entrySet()) {
+                maxRows = Math.max(maxRows, (e.getValue() == null) ? 0 : e.getValue().size());
+            }
+            // Convert each col to List<String>
+            for (Map.Entry<String, List<Object>> e : cols.entrySet()) {
+                String key = e.getKey();
+                List<Object> objList = e.getValue();
+                List<String> stringList = new ArrayList<>();
+                if (objList != null) {
+                    for (Object o : objList) stringList.add(o == null ? "" : String.valueOf(o));
+                }
+                // pad shorter lists to maxRows so structure is rectangular
+                while (stringList.size() < maxRows) stringList.add("");
+                columnData.put(key, stringList);
+            }
+
+            return processDataAndValidate(columnData, 1, Collections.singletonList("JSON"));
+        } catch (Exception ex) {
+            throw new Exception("JSON parsing failed: " + ex.getMessage(), ex);
+        }
+    }
+
+    /**
+     * Shared logic: validate required columns and run per-cell validation.
+     * Returns ExcelInfoResponse with sheetCount, sheetNames, sheetData and errors.
+     */
+    private ExcelInfoResponse processDataAndValidate(Map<String, List<String>> columnData,
+                                                     int sheetCount,
+                                                     List<String> sheetNames) {
+        List<String> errors = new ArrayList<>();
+        Map<String, ColumnValidationRule> rules = validationConfig.getValidations();
+        List<String> requiredColsFromConfig = validationConfig.getRequiredColumns();
+
+        // Build normalized header set from provided columnData keys
+        Set<String> normalizedHeaders = new HashSet<>();
+        for (String header : columnData.keySet()) {
+            normalizedHeaders.add(normalizeForCompare(header));
+        }
+
+        // 1) Check required columns presence (configurable), normalize comparison
+        if (requiredColsFromConfig != null) {
+            for (String required : requiredColsFromConfig) {
+                if (required == null || required.trim().isEmpty()) continue;
+                String reqNorm = normalizeForCompare(required);
+                if (!normalizedHeaders.contains(reqNorm)) {
+                    errors.add("Missing required column: " + required);
+                }
+            }
+        }
+
+        // If missing required columns, return early (no further validation)
+        if (!errors.isEmpty()) {
+            return new ExcelInfoResponse(sheetCount, sheetNames, Collections.emptyMap(), errors);
+        }
+
+        // 2) Validate each column by rule (if rule exists)
+        if (rules == null) rules = Collections.emptyMap();
+        for (Map.Entry<String, List<String>> entry : columnData.entrySet()) {
+            String colName = entry.getKey();
+            List<String> values = entry.getValue();
+
+            // propertyKey uses underscores as in application.properties
+            String propertyKey = colName.replace(" ", "_");
+            ColumnValidationRule rule = rules.get(propertyKey);
+
+            if (rule != null) {
+                for (int i = 0; i < values.size(); i++) {
+                    String value = values.get(i);
+                    // row number for messaging: i+2 if we think of header row 1 for excel; but for JSON we'll use i+1
+                    int displayRowNum = (sheetCount == 1 && sheetNames.size() == 1 && "JSON".equals(sheetNames.get(0)))
+                            ? (i + 1)
+                            : (i + 2);
+                    validateCell(value, rule, displayRowNum, colName, errors);
+                }
+            }
+        }
+
+        return new ExcelInfoResponse(sheetCount, sheetNames, columnData, errors);
     }
 
     // Normalization helper: convert underscores to spaces, trim, lower-case to compare flexibly
     private String normalizeForCompare(String s) {
         if (s == null) return "";
-        return s.replace('_', ' ').trim().toLowerCase();
+        return s.replace('_', ' ').trim().toLowerCase(Locale.ROOT);
     }
 
     // Convert cell to string, handling dates/numerics properly
@@ -129,10 +217,9 @@ public class ExcelService {
                 return cell.getStringCellValue();
             case NUMERIC:
                 if (DateUtil.isCellDateFormatted(cell)) {
-                    // default formatting for numeric date cells; doesn't validate format here
+                    // default formatting for numeric date cells
                     return new SimpleDateFormat("dd/MM/yyyy").format(cell.getDateCellValue());
                 } else {
-                    // remove trailing .0 for integer-like values
                     double d = cell.getNumericCellValue();
                     if (d == Math.floor(d)) {
                         return String.valueOf((long) d);
@@ -143,7 +230,6 @@ public class ExcelService {
             case BOOLEAN:
                 return String.valueOf(cell.getBooleanCellValue());
             case FORMULA:
-                // evaluate formula result as string where possible
                 try {
                     FormulaEvaluator evaluator = cell.getSheet().getWorkbook().getCreationHelper().createFormulaEvaluator();
                     CellValue evaluated = evaluator.evaluate(cell);
@@ -210,6 +296,7 @@ public class ExcelService {
                 break;
 
             default:
+                // unknown type: ignore
                 break;
         }
     }
