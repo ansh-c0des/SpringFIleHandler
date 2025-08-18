@@ -7,6 +7,8 @@ import com.Truboard.ExcelFileDetector.config.ExcelValidationConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.util.CellAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -17,6 +19,12 @@ import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
+/**
+ * ExcelService - validation + highlighting logic with robust header-rule lookup,
+ * rule-aware date formatting, and correct display-aware cell reading using
+ * DataFormatter + FormulaEvaluator so percent signs and displayed date/currency
+ * formats are preserved for validation.
+ */
 @Service
 public class ExcelService {
 
@@ -24,9 +32,34 @@ public class ExcelService {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final FileStorageService fileStorageService;
 
+    // Normalized map for rule lookup: normalizedHeader -> ColumnValidationRule
+    private final Map<String, ColumnValidationRule> normalizedRules = new HashMap<>();
+
     public ExcelService(ExcelValidationConfig validationConfig, FileStorageService fileStorageService) {
         this.validationConfig = validationConfig;
         this.fileStorageService = fileStorageService;
+
+        // Build normalized rules map for robust lookup (normalize keys like "Joining_Date" -> "joining date")
+        Map<String, ColumnValidationRule> rules = validationConfig.getValidations();
+        if (rules != null) {
+            for (Map.Entry<String, ColumnValidationRule> e : rules.entrySet()) {
+                String configuredKey = e.getKey(); // e.g. "ACQUISITION_DATE" or "PENAL_RATE"
+                ColumnValidationRule rule = e.getValue();
+                
+                // Store multiple normalized versions of the same rule
+                String norm1 = normalizeForCompare(configuredKey); // "acquisition_date" -> "acquisition_date"
+                String norm2 = normalizeForCompare(configuredKey.replace('_', ' ')); // "acquisition date"
+                String norm3 = normalizeForCompare(configuredKey).replace(' ', '_'); // "acquisition_date"
+                
+                normalizedRules.put(norm1, rule);
+                normalizedRules.put(norm2, rule);
+                normalizedRules.put(norm3, rule);
+                
+                System.out.println("Registered rule '" + configuredKey + "' with variants: " + 
+                    norm1 + ", " + norm2 + ", " + norm3);
+            }
+            System.out.println("Total normalized rules registered: " + normalizedRules.size());
+        }
     }
 
     /**
@@ -34,9 +67,12 @@ public class ExcelService {
      */
     public ExcelInfoResponse extractExcelInfo(MultipartFile file) throws Exception {
         String fileId = fileStorageService.storeFile(file);
-        
+
         try (InputStream inputStream = file.getInputStream();
              Workbook workbook = new XSSFWorkbook(inputStream)) {
+
+            FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
+            DataFormatter dataFormatter = new DataFormatter();
 
             int sheetCount = workbook.getNumberOfSheets();
             List<String> sheetNames = new ArrayList<>();
@@ -61,7 +97,7 @@ public class ExcelService {
             // Build columnData: Map<HeaderName, List<rowValues>>
             Map<String, List<String>> columnData = new LinkedHashMap<>();
             Map<String, Integer> columnIndexMap = new LinkedHashMap<>(); // Track column positions
-            
+
             int maxColumns = headerRow.getLastCellNum();
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
@@ -72,13 +108,28 @@ public class ExcelService {
 
                 columnIndexMap.put(colName, colIndex);
                 List<String> colValues = new ArrayList<>();
+
+                // Determine rule for this column (normalized lookup)
+                ColumnValidationRule ruleForColumn = getRuleForColumnName(colName);
+                System.out.println("Column '" + colName + "' -> Rule: " + 
+                    (ruleForColumn != null ? ruleForColumn.getType() + " (required: " + ruleForColumn.isRequired() + ")" : "NONE"));
+
                 for (int rowIndex = 1; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
                     Cell cell = (row == null)
                             ? null
                             : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                    String value = (cell == null) ? "" : getCellString(cell).trim();
-                    colValues.add(value);
+
+                    String value;
+                    if (cell == null) {
+                        value = "";
+                    } else {
+                        // For validation purposes, always get the raw displayed value
+                        // Don't apply special date formatting here as it might mask validation issues
+                        value = dataFormatter.formatCellValue(cell, evaluator);
+                    }
+
+                    colValues.add(value == null ? "" : value.trim());
                 }
                 columnData.put(colName, colValues);
             }
@@ -98,7 +149,7 @@ public class ExcelService {
      */
     public ExcelInfoResponse extractJsonInfo(MultipartFile file) throws Exception {
         String fileId = fileStorageService.storeFile(file);
-        
+
         // Try JSON array-of-objects first
         try (InputStream in = file.getInputStream()) {
             try {
@@ -108,12 +159,12 @@ public class ExcelService {
                 LinkedHashMap<String, List<String>> columnData = new LinkedHashMap<>();
                 LinkedHashMap<String, Integer> columnIndexMap = new LinkedHashMap<>();
                 LinkedHashSet<String> keysOrder = new LinkedHashSet<>();
-                
+
                 for (Map<String, Object> row : rows) {
                     if (row == null) continue;
                     keysOrder.addAll(row.keySet());
                 }
-                
+
                 int colIndex = 0;
                 for (String key : keysOrder) {
                     columnData.put(key, new ArrayList<>());
@@ -143,12 +194,12 @@ public class ExcelService {
 
             LinkedHashMap<String, List<String>> columnData = new LinkedHashMap<>();
             LinkedHashMap<String, Integer> columnIndexMap = new LinkedHashMap<>();
-            
+
             int maxRows = 0;
             for (Map.Entry<String, List<Object>> e : cols.entrySet()) {
                 maxRows = Math.max(maxRows, (e.getValue() == null) ? 0 : e.getValue().size());
             }
-            
+
             int colIndex = 0;
             for (Map.Entry<String, List<Object>> e : cols.entrySet()) {
                 String key = e.getKey();
@@ -181,7 +232,7 @@ public class ExcelService {
 
         byte[] originalContent = fileStorageService.getFileContent(fileId);
         String fileName = fileStorageService.getFileName(fileId);
-        
+
         if (fileName == null || !fileName.toLowerCase().endsWith(".xlsx")) {
             throw new Exception("Error highlighting is only supported for Excel files");
         }
@@ -190,9 +241,12 @@ public class ExcelService {
         try (InputStream inputStream = new ByteArrayInputStream(originalContent);
              Workbook workbook = new XSSFWorkbook(inputStream)) {
 
+            FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
+            DataFormatter dataFormatter = new DataFormatter();
+
             int sheetCount = workbook.getNumberOfSheets();
             Sheet sheetToRead = (sheetCount == 1) ? workbook.getSheetAt(0) : workbook.getSheet("Data");
-            
+
             if (sheetToRead == null) {
                 throw new Exception("Sheet named 'Data' not found in the workbook");
             }
@@ -205,7 +259,7 @@ public class ExcelService {
             // Build column data and get validation errors
             Map<String, List<String>> columnData = new LinkedHashMap<>();
             Map<String, Integer> columnIndexMap = new LinkedHashMap<>();
-            
+
             int maxColumns = headerRow.getLastCellNum();
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
@@ -216,21 +270,28 @@ public class ExcelService {
 
                 columnIndexMap.put(colName, colIndex);
                 List<String> colValues = new ArrayList<>();
+
                 for (int rowIndex = 1; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
                     Cell cell = (row == null) ? null : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                    String value = (cell == null) ? "" : getCellString(cell).trim();
-                    colValues.add(value);
+                    String value;
+                    if (cell == null) {
+                        value = "";
+                    } else {
+                        // For validation, always use the displayed value without special formatting
+                        value = dataFormatter.formatCellValue(cell, evaluator);
+                    }
+                    colValues.add(value == null ? "" : value.trim());
                 }
                 columnData.put(colName, colValues);
             }
 
             // Get detailed validation errors
             List<ValidationError> detailedErrors = getDetailedValidationErrors(columnData, columnIndexMap);
-            
+
             // Apply highlighting and comments
             applyErrorHighlighting(workbook, sheetToRead, detailedErrors);
-            
+
             // Write modified workbook to byte array
             ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
             workbook.write(outputStream);
@@ -239,94 +300,136 @@ public class ExcelService {
     }
 
     /**
-     * Apply error highlighting and comments to Excel cells
+     * Apply error highlighting and comments to Excel cells - FIXED VERSION
      */
     private void applyErrorHighlighting(Workbook workbook, Sheet sheet, List<ValidationError> errors) {
-        // Create red background style
+        if (errors == null || errors.isEmpty()) return;
+
+        // Create ONE red background style and reuse it
         CellStyle errorStyle = workbook.createCellStyle();
         errorStyle.setFillForegroundColor(IndexedColors.RED.getIndex());
         errorStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-        
+
         // Create drawing patriarch for comments
         Drawing<?> drawing = sheet.createDrawingPatriarch();
         CreationHelper creationHelper = workbook.getCreationHelper();
-        
+
+        System.out.println("Applying highlighting for " + errors.size() + " errors");
+
         for (ValidationError error : errors) {
-            // CRITICAL FIX: Ensure valid row and column indices
             int colIndex = error.getColumnIndex();
             // A rowNumber of 0 indicates a missing column error, which cannot be highlighted on a cell
             if (error.getRowNumber() <= 0 || colIndex < 0) {
-                continue; 
+                System.out.println("Skipping error for missing column or invalid position: " + error.getMessage());
+                continue;
             }
-            int rowIndex = error.getRowNumber() - 1; // Convert to 0-based index
             
-            Row row = sheet.getRow(rowIndex);
-            if (row == null) continue;
-            
-            // CRITICAL FIX: Get cell, but create it if it doesn't exist
-            Cell cell = row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+            int rowIndex = error.getRowNumber(); // This is already 1-based from Excel, convert to 0-based
+            // Adjust for header row - if rowNumber is 2, it should be row index 1 (second row, first data row)
+            int zeroBasedRowIndex = rowIndex - 1;
 
-            // Apply red background
-            cell.setCellStyle(errorStyle);
-            
-            // Add comment with error message
-            ClientAnchor anchor = creationHelper.createClientAnchor();
-            anchor.setCol1(colIndex);
-            anchor.setCol2(colIndex + 3);
-            anchor.setRow1(rowIndex);
-            anchor.setRow2(rowIndex + 3);
-            
-            Comment comment = drawing.createCellComment(anchor);
-            RichTextString richTextString = creationHelper.createRichTextString(
-                "Validation Error:\n" + error.getMessage() + "\nCurrent value: " + error.getCellValue()
-            );
-            comment.setString(richTextString);
-            comment.setAuthor("Excel Validator");
-            cell.setCellComment(comment);
+            System.out.println("Processing error: Column=" + colIndex + ", Row=" + rowIndex + " (0-based: " + zeroBasedRowIndex + "), Message=" + error.getMessage());
+
+            Row row = sheet.getRow(zeroBasedRowIndex);
+            if (row == null) {
+                System.out.println("Row " + zeroBasedRowIndex + " is null, creating it");
+                row = sheet.createRow(zeroBasedRowIndex);
+            }
+
+            // Get or create cell
+            Cell cell = row.getCell(colIndex);
+            if (cell == null) {
+                System.out.println("Cell at column " + colIndex + " is null, creating it");
+                cell = row.createCell(colIndex);
+            }
+
+            try {
+                // Clone the existing cell style and add red background
+                CellStyle newStyle = workbook.createCellStyle();
+                if (cell.getCellStyle() != null) {
+                    newStyle.cloneStyleFrom(cell.getCellStyle());
+                }
+                newStyle.setFillForegroundColor(IndexedColors.RED.getIndex());
+                newStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+                
+                // Apply the style
+                cell.setCellStyle(newStyle);
+                System.out.println("Applied red background to cell at column " + colIndex + ", row " + zeroBasedRowIndex);
+
+                // Add comment with error message
+                ClientAnchor anchor = creationHelper.createClientAnchor();
+                anchor.setCol1(colIndex);
+                anchor.setCol2(colIndex + 3);
+                anchor.setRow1(zeroBasedRowIndex);
+                anchor.setRow2(zeroBasedRowIndex + 3);
+
+                Comment comment = drawing.createCellComment(anchor);
+                RichTextString richTextString = creationHelper.createRichTextString(
+                        "Validation Error:\n" + error.getMessage() + 
+                        "\nCurrent value: " + (error.getCellValue() == null ? "" : error.getCellValue())
+                );
+                comment.setString(richTextString);
+                comment.setAuthor("Excel Validator");
+                cell.setCellComment(comment);
+                System.out.println("Added comment to cell");
+
+            } catch (Exception e) {
+                System.err.println("Error applying formatting to cell at column " + colIndex + ", row " + zeroBasedRowIndex + ": " + e.getMessage());
+                e.printStackTrace();
+            }
         }
     }
 
     /**
      * Get detailed validation errors with cell positions
      */
-    private List<ValidationError> getDetailedValidationErrors(Map<String, List<String>> columnData, 
+    private List<ValidationError> getDetailedValidationErrors(Map<String, List<String>> columnData,
                                                               Map<String, Integer> columnIndexMap) {
         List<ValidationError> detailedErrors = new ArrayList<>();
         Map<String, ColumnValidationRule> rules = validationConfig.getValidations();
-        
+
         if (rules == null) rules = Collections.emptyMap();
-        
+
+        System.out.println("Getting detailed validation errors for " + columnData.size() + " columns");
+
         for (Map.Entry<String, List<String>> entry : columnData.entrySet()) {
             String colName = entry.getKey();
             List<String> values = entry.getValue();
             Integer colIndex = columnIndexMap.get(colName);
-            
+
             if (colIndex == null) colIndex = -1;
-            
-            String propertyKey = colName.replace(" ", "_");
-            ColumnValidationRule rule = rules.get(propertyKey);
-            
+
+            // Use normalized lookup
+            ColumnValidationRule rule = getRuleForColumnName(colName);
+            System.out.println("Column: " + colName + ", Rule: " + (rule != null ? rule.getType() : "none"));
+
             if (rule != null) {
                 for (int i = 0; i < values.size(); i++) {
                     String value = values.get(i);
                     int displayRowNum = i + 2; // Excel row number (1-based + header)
-                    
+
                     List<String> cellErrors = new ArrayList<>();
                     validateCellDetailed(value, rule, cellErrors);
-                    
+
+                    if (!cellErrors.isEmpty()) {
+                        System.out.println("Found errors in column " + colName + ", row " + displayRowNum + ", value: '" + value + "'");
+                        System.out.println("Errors: " + cellErrors);
+                    }
+
                     for (String errorMsg : cellErrors) {
                         detailedErrors.add(new ValidationError(
-                            colName, 
-                            displayRowNum, 
-                            colIndex, 
-                            "Row " + displayRowNum + ": " + colName + " " + errorMsg,
-                            value
+                                colName,
+                                displayRowNum,
+                                colIndex,
+                                "Row " + displayRowNum + ": " + colName + " " + errorMsg,
+                                value
                         ));
                     }
                 }
             }
         }
-        
+
+        System.out.println("Total detailed errors found: " + detailedErrors.size());
         return detailedErrors;
     }
 
@@ -358,7 +461,6 @@ public class ExcelService {
                 if (!normalizedHeaders.contains(reqNorm)) {
                     String missingError = "Missing required column: " + required;
                     errors.add(missingError);
-                    // Add a detailed error for the missing column itself
                     detailedErrors.add(new ValidationError(required, 0, -1, missingError, null));
                 }
             }
@@ -373,18 +475,17 @@ public class ExcelService {
 
             if (colIndex == null) colIndex = -1;
 
-            // propertyKey uses underscores as in application.properties: "Joining_Date"
-            String propertyKey = colName.replace(" ", "_");
-            ColumnValidationRule rule = rules.get(propertyKey);
+            // Use normalized rule lookup
+            ColumnValidationRule rule = getRuleForColumnName(colName);
 
             if (rule != null) {
                 for (int i = 0; i < values.size(); i++) {
                     String value = values.get(i);
                     int displayRowNum = ("json".equals(fileType)) ? (i + 1) : (i + 2);
-                    
+
                     List<String> cellErrors = new ArrayList<>();
                     validateCellDetailed(value, rule, cellErrors);
-                    
+
                     for (String errorMsg : cellErrors) {
                         String fullErrorMsg = "Row " + displayRowNum + ": " + colName + " " + errorMsg;
                         errors.add(fullErrorMsg);
@@ -397,73 +498,102 @@ public class ExcelService {
         return new ExcelInfoResponse(sheetCount, sheetNames, columnData, errors, detailedErrors, null, fileType);
     }
 
-    // Normalization helper: convert underscores to spaces, trim, lower-case to compare flexibly
-    private String normalizeForCompare(String s) {
-        if (s == null) return "";
-        return s.replace('_', ' ').trim().toLowerCase(Locale.ROOT);
+    /**
+     * Return the ColumnValidationRule for a column header using enhanced lookup.
+     */
+    private ColumnValidationRule getRuleForColumnName(String columnHeader) {
+        return findRuleForColumn(columnHeader);
     }
 
-    // Convert cell to string, handling dates/numerics properly
-    private String getCellString(Cell cell) {
-        if (cell == null) return "";
-        switch (cell.getCellType()) {
-            case STRING:
-                return cell.getStringCellValue();
-            case NUMERIC:
-                if (DateUtil.isCellDateFormatted(cell)) {
-                    // default formatting for numeric date cells
-                    return new SimpleDateFormat("dd/MM/yyyy").format(cell.getDateCellValue());
-                } else {
-                    double d = cell.getNumericCellValue();
-                    if (d == Math.floor(d)) {
-                        return String.valueOf((long) d);
-                    } else {
-                        return String.valueOf(d);
-                    }
-                }
-            case BOOLEAN:
-                return String.valueOf(cell.getBooleanCellValue());
-            case FORMULA:
-                try {
-                    FormulaEvaluator evaluator = cell.getSheet().getWorkbook().getCreationHelper().createFormulaEvaluator();
-                    CellValue evaluated = evaluator.evaluate(cell);
-                    if (evaluated == null) return "";
-                    switch (evaluated.getCellType()) {
-                        case STRING: return evaluated.getStringValue();
-                        case NUMERIC:
-                            double dn = evaluated.getNumberValue();
-                            if (dn == Math.floor(dn)) return String.valueOf((long) dn);
-                            return String.valueOf(dn);
-                        case BOOLEAN: return String.valueOf(evaluated.getBooleanValue());
-                        default: return "";
-                    }
-                } catch (Exception e) {
-                    return cell.getCellFormula();
-                }
-            case BLANK:
-            default:
-                return "";
+    /**
+     * Normalization for header/rule matching:
+     * - replace underscores with spaces and spaces with underscores for bidirectional matching
+     * - remove punctuation (non alnum/space/underscore)
+     * - collapse multiple spaces and lowercase
+     */
+    private String normalizeForCompare(String s) {
+        if (s == null) return "";
+        String cleaned = s.replaceAll("[^A-Za-z0-9 _ ]+", "")  // Keep only alphanumeric, spaces, and underscores
+                .trim()
+                .replaceAll("\\s{2,}", " ")  // Collapse multiple spaces
+                .toLowerCase(Locale.ROOT);
+        return cleaned;
+    }
+
+    /**
+     * Enhanced rule lookup that tries multiple normalization strategies
+     */
+    private ColumnValidationRule findRuleForColumn(String columnHeader) {
+        if (columnHeader == null) return null;
+        
+        String normalized = normalizeForCompare(columnHeader);
+        
+        // Strategy 1: Direct normalized lookup
+        ColumnValidationRule rule = normalizedRules.get(normalized);
+        if (rule != null) {
+            System.out.println("Found rule for '" + columnHeader + "' using direct lookup: " + normalized);
+            return rule;
         }
+        
+        // Strategy 2: Try with spaces replaced by underscores
+        String withUnderscores = normalized.replace(' ', '_');
+        rule = normalizedRules.get(withUnderscores);
+        if (rule != null) {
+            System.out.println("Found rule for '" + columnHeader + "' using underscore replacement: " + withUnderscores);
+            return rule;
+        }
+        
+        // Strategy 3: Try with underscores replaced by spaces
+        String withSpaces = normalized.replace('_', ' ');
+        rule = normalizedRules.get(withSpaces);
+        if (rule != null) {
+            System.out.println("Found rule for '" + columnHeader + "' using space replacement: " + withSpaces);
+            return rule;
+        }
+        
+        // Strategy 4: Try exact match with original keys (case insensitive)
+        for (Map.Entry<String, ColumnValidationRule> entry : normalizedRules.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(columnHeader)) {
+                System.out.println("Found rule for '" + columnHeader + "' using case-insensitive exact match");
+                return entry.getValue();
+            }
+        }
+        
+        System.out.println("No rule found for column: '" + columnHeader + "' (normalized: '" + normalized + "')");
+        System.out.println("Available rules: " + normalizedRules.keySet());
+        return null;
     }
 
     /**
      * Enhanced cell validation that collects all errors for a single cell
+     *
+     * Supported rule types:
+     *  - number   : numeric (accepts commas), floats like 0.02, 0.2833294
+     *  - percent  : requires trailing % e.g. 12.00% (validator expects % in the string)
+     *  - currency : numeric with commas allowed e.g. 86,000,000.00
+     *  - date     : validated with rule.format (SimpleDateFormat)
+     *  - text     : validated with regex if provided
      */
     private void validateCellDetailed(String value, ColumnValidationRule rule, List<String> errors) {
         // Required check
-        if (rule.isRequired() && (value == null || value.isEmpty())) {
+        if (rule.isRequired() && (value == null || value.trim().isEmpty())) {
             errors.add("is required");
             return;
         }
 
         // Skip further checks if empty and not required
-        if (value == null || value.isEmpty()) return;
+        if (value == null || value.trim().isEmpty()) return;
 
         String type = (rule.getType() == null) ? "" : rule.getType().toLowerCase(Locale.ROOT);
         switch (type) {
-            case "number":
+            case "number": {
+                String normalized = value.trim().replaceAll(",", "");
+                if (normalized.endsWith("%")) {
+                    errors.add("must be a numeric value (no % sign)");
+                    return;
+                }
                 try {
-                    double num = Double.parseDouble(value);
+                    double num = Double.parseDouble(normalized);
                     if (rule.getMin() != null && num < rule.getMin()) {
                         errors.add("must be >= " + rule.getMin());
                     }
@@ -474,22 +604,70 @@ public class ExcelService {
                     errors.add("must be a number");
                 }
                 break;
+            }
 
-            case "date":
+            case "percent": {
+                String v = value.trim();
+                if (!v.endsWith("%")) {
+                    errors.add("must be a percentage string ending with % (e.g. 12.00%)");
+                    break;
+                }
+                String numericPart = v.substring(0, v.length() - 1).trim().replaceAll(",", "");
                 try {
-                    SimpleDateFormat sdf = new SimpleDateFormat(rule.getFormat());
-                    sdf.setLenient(false);
-                    sdf.parse(value);
-                } catch (Exception e) {
-                    errors.add("must match date format " + rule.getFormat());
+                    double num = Double.parseDouble(numericPart);
+                    if (rule.getMin() != null && num < rule.getMin()) {
+                        errors.add("must be >= " + rule.getMin() + "%");
+                    }
+                    if (rule.getMax() != null && num > rule.getMax()) {
+                        errors.add("must be <= " + rule.getMax() + "%");
+                    }
+                } catch (NumberFormatException e) {
+                    errors.add("must be a percentage number like 12.00%");
                 }
                 break;
+            }
 
-            case "text":
-                if (rule.getRegex() != null && !value.matches(rule.getRegex())) {
-                    errors.add("format is invalid");
+            case "currency": {
+                String normalized = value.trim().replaceAll(",", "");
+                try {
+                    double num = Double.parseDouble(normalized);
+                    if (rule.getMin() != null && num < rule.getMin()) {
+                        errors.add("must be >= " + rule.getMin());
+                    }
+                    if (rule.getMax() != null && num > rule.getMax()) {
+                        errors.add("must be <= " + rule.getMax());
+                    }
+                } catch (NumberFormatException e) {
+                    errors.add("must be a currency numeric value (e.g. 86,000,000.00)");
                 }
                 break;
+            }
+
+            case "date": {
+                String format = rule.getFormat();
+                if (format == null || format.trim().isEmpty()) {
+                    errors.add("date format not specified in configuration");
+                    return;
+                }
+                
+                try {
+                    SimpleDateFormat sdf = new SimpleDateFormat(format);
+                    sdf.setLenient(false);
+                    sdf.parse(value.trim());
+                } catch (Exception e) {
+                    errors.add("must match date format " + format + " (current value: '" + value + "')");
+                }
+                break;
+            }
+
+            case "text": {
+                if (rule.getRegex() != null && !rule.getRegex().isEmpty()) {
+                    if (!value.matches(rule.getRegex())) {
+                        errors.add("format is invalid");
+                    }
+                }
+                break;
+            }
 
             default:
                 break;
