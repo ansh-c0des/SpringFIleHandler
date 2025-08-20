@@ -45,18 +45,18 @@ public class ExcelService {
             for (Map.Entry<String, ColumnValidationRule> e : rules.entrySet()) {
                 String configuredKey = e.getKey(); // e.g. "ACQUISITION_DATE" or "PENAL_RATE"
                 ColumnValidationRule rule = e.getValue();
-                
+
                 // Store multiple normalized versions of the same rule
-                String norm1 = normalizeForCompare(configuredKey); // "acquisition_date" -> "acquisition_date"
-                String norm2 = normalizeForCompare(configuredKey.replace('_', ' ')); // "acquisition date"
-                String norm3 = normalizeForCompare(configuredKey).replace(' ', '_'); // "acquisition_date"
-                
+                String norm1 = normalizeForCompare(configuredKey); // normalized
+                String norm2 = normalizeForCompare(configuredKey.replace('_', ' ')); // spaces
+                String norm3 = normalizeForCompare(configuredKey).replace(' ', '_'); // underscores
+
                 normalizedRules.put(norm1, rule);
                 normalizedRules.put(norm2, rule);
                 normalizedRules.put(norm3, rule);
-                
-                System.out.println("Registered rule '" + configuredKey + "' with variants: " + 
-                    norm1 + ", " + norm2 + ", " + norm3);
+
+                System.out.println("Registered rule '" + configuredKey + "' with variants: " +
+                        norm1 + ", " + norm2 + ", " + norm3);
             }
             System.out.println("Total normalized rules registered: " + normalizedRules.size());
         }
@@ -99,6 +99,11 @@ public class ExcelService {
             Map<String, Integer> columnIndexMap = new LinkedHashMap<>(); // Track column positions
 
             int maxColumns = headerRow.getLastCellNum();
+
+            // Determine last meaningful data row (ignore trailing empty rows)
+            int lastDataRow = findLastNonEmptyRow(sheetToRead, maxColumns, dataFormatter, evaluator);
+            System.out.println("Determined last meaningful data row: " + lastDataRow);
+
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
                 String colName = headerCell.toString().trim();
@@ -111,10 +116,11 @@ public class ExcelService {
 
                 // Determine rule for this column (normalized lookup)
                 ColumnValidationRule ruleForColumn = getRuleForColumnName(colName);
-                System.out.println("Column '" + colName + "' -> Rule: " + 
-                    (ruleForColumn != null ? ruleForColumn.getType() + " (required: " + ruleForColumn.isRequired() + ")" : "NONE"));
+                System.out.println("Column '" + colName + "' -> Rule: " +
+                        (ruleForColumn != null ? ruleForColumn.getType() + " (required: " + ruleForColumn.isRequired() + ")" : "NONE"));
 
-                for (int rowIndex = 1; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
+                // Only iterate up to lastDataRow (ignore trailing empty rows)
+                for (int rowIndex = 1; rowIndex <= lastDataRow; rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
                     Cell cell = (row == null)
                             ? null
@@ -124,8 +130,7 @@ public class ExcelService {
                     if (cell == null) {
                         value = "";
                     } else {
-                        // For validation purposes, always get the raw displayed value
-                        // Don't apply special date formatting here as it might mask validation issues
+                        // For validation purposes, always get the displayed value using DataFormatter + evaluator
                         value = dataFormatter.formatCellValue(cell, evaluator);
                     }
 
@@ -261,6 +266,11 @@ public class ExcelService {
             Map<String, Integer> columnIndexMap = new LinkedHashMap<>();
 
             int maxColumns = headerRow.getLastCellNum();
+
+            // Determine last meaningful data row (ignore trailing empty rows)
+            int lastDataRow = findLastNonEmptyRow(sheetToRead, maxColumns, dataFormatter, evaluator);
+            System.out.println("generateErrorHighlightedExcel - lastDataRow: " + lastDataRow);
+
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
                 String colName = headerCell.toString().trim();
@@ -271,7 +281,7 @@ public class ExcelService {
                 columnIndexMap.put(colName, colIndex);
                 List<String> colValues = new ArrayList<>();
 
-                for (int rowIndex = 1; rowIndex <= sheetToRead.getLastRowNum(); rowIndex++) {
+                for (int rowIndex = 1; rowIndex <= lastDataRow; rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
                     Cell cell = (row == null) ? null : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
                     String value;
@@ -323,9 +333,8 @@ public class ExcelService {
                 System.out.println("Skipping error for missing column or invalid position: " + error.getMessage());
                 continue;
             }
-            
-            int rowIndex = error.getRowNumber(); // This is already 1-based from Excel, convert to 0-based
-            // Adjust for header row - if rowNumber is 2, it should be row index 1 (second row, first data row)
+
+            int rowIndex = error.getRowNumber(); // 1-based Excel row number
             int zeroBasedRowIndex = rowIndex - 1;
 
             System.out.println("Processing error: Column=" + colIndex + ", Row=" + rowIndex + " (0-based: " + zeroBasedRowIndex + "), Message=" + error.getMessage());
@@ -351,7 +360,7 @@ public class ExcelService {
                 }
                 newStyle.setFillForegroundColor(IndexedColors.RED.getIndex());
                 newStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-                
+
                 // Apply the style
                 cell.setCellStyle(newStyle);
                 System.out.println("Applied red background to cell at column " + colIndex + ", row " + zeroBasedRowIndex);
@@ -365,8 +374,8 @@ public class ExcelService {
 
                 Comment comment = drawing.createCellComment(anchor);
                 RichTextString richTextString = creationHelper.createRichTextString(
-                        "Validation Error:\n" + error.getMessage() + 
-                        "\nCurrent value: " + (error.getCellValue() == null ? "" : error.getCellValue())
+                        "Validation Error:\n" + error.getMessage() +
+                                "\nCurrent value: " + (error.getCellValue() == null ? "" : error.getCellValue())
                 );
                 comment.setString(richTextString);
                 comment.setAuthor("Excel Validator");
@@ -525,16 +534,16 @@ public class ExcelService {
      */
     private ColumnValidationRule findRuleForColumn(String columnHeader) {
         if (columnHeader == null) return null;
-        
+
         String normalized = normalizeForCompare(columnHeader);
-        
+
         // Strategy 1: Direct normalized lookup
         ColumnValidationRule rule = normalizedRules.get(normalized);
         if (rule != null) {
             System.out.println("Found rule for '" + columnHeader + "' using direct lookup: " + normalized);
             return rule;
         }
-        
+
         // Strategy 2: Try with spaces replaced by underscores
         String withUnderscores = normalized.replace(' ', '_');
         rule = normalizedRules.get(withUnderscores);
@@ -542,7 +551,7 @@ public class ExcelService {
             System.out.println("Found rule for '" + columnHeader + "' using underscore replacement: " + withUnderscores);
             return rule;
         }
-        
+
         // Strategy 3: Try with underscores replaced by spaces
         String withSpaces = normalized.replace('_', ' ');
         rule = normalizedRules.get(withSpaces);
@@ -550,7 +559,7 @@ public class ExcelService {
             System.out.println("Found rule for '" + columnHeader + "' using space replacement: " + withSpaces);
             return rule;
         }
-        
+
         // Strategy 4: Try exact match with original keys (case insensitive)
         for (Map.Entry<String, ColumnValidationRule> entry : normalizedRules.entrySet()) {
             if (entry.getKey().equalsIgnoreCase(columnHeader)) {
@@ -558,10 +567,37 @@ public class ExcelService {
                 return entry.getValue();
             }
         }
-        
+
         System.out.println("No rule found for column: '" + columnHeader + "' (normalized: '" + normalized + "')");
         System.out.println("Available rules: " + normalizedRules.keySet());
         return null;
+    }
+
+    /**
+     * Helper that finds the last non-empty row index (1-based row index values) for data.
+     * Returns 0 if no data rows found (i.e., only header exists).
+     *
+     * We inspect displayed cell text using DataFormatter + FormulaEvaluator to match what the user sees.
+     */
+    private int findLastNonEmptyRow(Sheet sheet, int maxColumns, DataFormatter formatter, FormulaEvaluator evaluator) {
+        int lastRowNum = sheet.getLastRowNum();
+        for (int r = lastRowNum; r >= 1; r--) { // start from bottom, ignore header row (0)
+            Row row = sheet.getRow(r);
+            if (row == null) continue;
+            boolean anyNonEmpty = false;
+            for (int c = 0; c < maxColumns; c++) {
+                Cell cell = row.getCell(c, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                String text = formatter.formatCellValue(cell, evaluator);
+                if (text != null && !text.trim().isEmpty()) {
+                    anyNonEmpty = true;
+                    break;
+                }
+            }
+            if (anyNonEmpty) {
+                return r; // r is 0-based index; we use it in loops as 1..r
+            }
+        }
+        return 0;
     }
 
     /**
@@ -649,7 +685,7 @@ public class ExcelService {
                     errors.add("date format not specified in configuration");
                     return;
                 }
-                
+
                 try {
                     SimpleDateFormat sdf = new SimpleDateFormat(format);
                     sdf.setLenient(false);
