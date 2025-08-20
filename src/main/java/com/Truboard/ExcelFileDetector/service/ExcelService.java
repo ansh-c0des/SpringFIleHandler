@@ -7,7 +7,6 @@ import com.Truboard.ExcelFileDetector.config.ExcelValidationConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.util.CellAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
@@ -27,10 +26,10 @@ import java.util.*;
  *
  * Added behavior:
  * - Auto-fill empty cells inside dataset for critical columns:
- *   INTEREST RATE, PENAL RATE, PENAL CHARGE RATE => auto-fill "0.00%"
- *   OPENING PRINCIPAL => auto-fill "0.00"
+ * INTEREST RATE, PENAL RATE, PENAL CHARGE RATE => auto-fill "0.00%"
+ * OPENING PRINCIPAL => auto-fill "0.00"
  * - Auto-filled cells are colored YELLOW and get a comment:
- *   "The cell was empty. Filled with default value 0"
+ * "The cell was empty. Filled with default value 0"
  * - Auto-fill happens BEFORE re-validating, so auto-filled cells are valid.
  */
 @Service
@@ -71,88 +70,135 @@ public class ExcelService {
     }
 
     /**
-     * Process an uploaded .xlsx file: extract column-wise data and validate.
+     * Process an uploaded .xlsx file: extract column-wise data, auto-fill, and validate.
+     * This method now also handles auto-filling and yellow highlighting.
      */
-    public ExcelInfoResponse extractExcelInfo(MultipartFile file) throws Exception {
-        String fileId = fileStorageService.storeFile(file);
+    public ExcelInfoResponse extractAndProcessExcelInfo(MultipartFile file) throws Exception {
+        byte[] originalContent = file.getBytes();
+        Workbook workbook = new XSSFWorkbook(new ByteArrayInputStream(originalContent));
 
-        try (InputStream inputStream = file.getInputStream();
-             Workbook workbook = new XSSFWorkbook(inputStream)) {
+        FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
+        DataFormatter dataFormatter = new DataFormatter();
+        CreationHelper creationHelper = workbook.getCreationHelper();
 
-            FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
-            DataFormatter dataFormatter = new DataFormatter();
-
-            int sheetCount = workbook.getNumberOfSheets();
-            List<String> sheetNames = new ArrayList<>();
-            for (int i = 0; i < sheetCount; i++) {
-                sheetNames.add(workbook.getSheetName(i));
-            }
-
-            // Pick correct sheet (Data if >1, otherwise first)
-            Sheet sheetToRead = (sheetCount == 1)
-                    ? workbook.getSheetAt(0)
-                    : workbook.getSheet("Data");
-            if (sheetToRead == null) {
-                throw new Exception("Sheet named 'Data' not found in the workbook");
-            }
-
-            // Header row
-            Row headerRow = sheetToRead.getRow(0);
-            if (headerRow == null) {
-                throw new Exception("No header row found in sheet");
-            }
-
-            // Build columnData: Map<HeaderName, List<rowValues>>
-            Map<String, List<String>> columnData = new LinkedHashMap<>();
-            Map<String, Integer> columnIndexMap = new LinkedHashMap<>(); // Track column positions
-
-            int maxColumns = headerRow.getLastCellNum();
-
-            // Determine last meaningful data row (ignore trailing empty rows)
-            int lastDataRow = findLastNonEmptyRow(sheetToRead, maxColumns, dataFormatter, evaluator);
-            System.out.println("Determined last meaningful data row: " + lastDataRow);
-
-            for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
-                Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                String colName = headerCell.toString().trim();
-                if (colName.isEmpty()) {
-                    colName = "Column_" + (colIndex + 1);
-                }
-
-                columnIndexMap.put(colName, colIndex);
-                List<String> colValues = new ArrayList<>();
-
-                // Determine rule for this column (normalized lookup)
-                ColumnValidationRule ruleForColumn = getRuleForColumnName(colName);
-                System.out.println("Column '" + colName + "' -> Rule: " +
-                        (ruleForColumn != null ? ruleForColumn.getType() + " (required: " + ruleForColumn.isRequired() + ")" : "NONE"));
-
-                // Only iterate up to lastDataRow (ignore trailing empty rows)
-                for (int rowIndex = 1; rowIndex <= lastDataRow; rowIndex++) {
-                    Row row = sheetToRead.getRow(rowIndex);
-                    Cell cell = (row == null)
-                            ? null
-                            : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-
-                    String value;
-                    if (cell == null) {
-                        value = "";
-                    } else {
-                        // For validation purposes, always get the displayed value using DataFormatter + evaluator
-                        value = dataFormatter.formatCellValue(cell, evaluator);
-                    }
-
-                    colValues.add(value == null ? "" : value.trim());
-                }
-                columnData.put(colName, colValues);
-            }
-
-            // Delegate to common validation/response builder
-            ExcelInfoResponse response = processDataAndValidate(columnData, sheetCount, sheetNames, columnIndexMap, "xlsx");
-            response.setFileId(fileId);
-            response.setFileType("xlsx");
-            return response;
+        // Find the correct sheet
+        int sheetCount = workbook.getNumberOfSheets();
+        Sheet sheetToProcess = (sheetCount == 1) ? workbook.getSheetAt(0) : workbook.getSheet("Data");
+        if (sheetToProcess == null) {
+            throw new Exception("Sheet named 'Data' not found in the workbook");
         }
+
+        Row headerRow = sheetToProcess.getRow(0);
+        if (headerRow == null) {
+            throw new Exception("No header row found in sheet");
+        }
+
+        int maxColumns = headerRow.getLastCellNum();
+        int lastDataRow = findLastNonEmptyRow(sheetToProcess, maxColumns, dataFormatter, evaluator);
+
+        // --- AUTO-FILL PASS: Modify the workbook directly ---
+        // Normalized names for the columns to auto-fill
+        Set<String> autoFillNormalized = new HashSet<>(Arrays.asList(
+                normalizeForCompare("INTEREST RATE"),
+                normalizeForCompare("PENAL RATE"),
+                normalizeForCompare("PENAL CHARGE RATE"),
+                normalizeForCompare("OPENING PRINCIPAL")
+        ));
+
+        // Prepare drawing & yellow style for auto-filled cells
+        Drawing<?> drawing = sheetToProcess.createDrawingPatriarch();
+        CellStyle yellowStyle = workbook.createCellStyle();
+        yellowStyle.setFillForegroundColor(IndexedColors.YELLOW.getIndex());
+        yellowStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        Map<String, Integer> columnIndexMap = new LinkedHashMap<>();
+
+        for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
+            Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+            String colName = headerCell.toString().trim();
+            if (colName.isEmpty()) {
+                colName = "Column_" + (colIndex + 1);
+            }
+            columnIndexMap.put(colName, colIndex);
+
+            String colNorm = normalizeForCompare(colName);
+            boolean isAutoFillColumn = autoFillNormalized.contains(colNorm);
+
+            if (isAutoFillColumn) {
+                boolean isOpeningPrincipal = normalizeForCompare("OPENING PRINCIPAL").equals(colNorm);
+                String defaultValue = isOpeningPrincipal ? "0.00" : "0%";
+
+                for (int rowIndex = 1; rowIndex <= lastDataRow; rowIndex++) {
+                    Row row = sheetToProcess.getRow(rowIndex);
+                    if (row == null) {
+                        row = sheetToProcess.createRow(rowIndex);
+                    }
+                    Cell cell = row.getCell(colIndex);
+                    if (cell == null || dataFormatter.formatCellValue(cell, evaluator).trim().isEmpty()) {
+                        cell = row.createCell(colIndex);
+                        cell.setCellValue(defaultValue);
+
+                        try {
+                            CellStyle newStyle = workbook.createCellStyle();
+                            if (cell.getCellType() != CellType.BLANK && cell.getCellStyle() != null) {
+                                newStyle.cloneStyleFrom(cell.getCellStyle());
+                            }
+                            newStyle.setFillForegroundColor(IndexedColors.YELLOW.getIndex());
+                            newStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+                            cell.setCellStyle(newStyle);
+                        } catch (Exception ex) {
+                            cell.setCellStyle(yellowStyle);
+                        }
+
+                        ClientAnchor anchor = creationHelper.createClientAnchor();
+                        anchor.setCol1(colIndex);
+                        anchor.setCol2(colIndex + 3);
+                        anchor.setRow1(rowIndex);
+                        anchor.setRow2(rowIndex + 3);
+
+                        Comment comment = drawing.createCellComment(anchor);
+                        comment.setString(creationHelper.createRichTextString("The cell was empty. Filled with default value 0"));
+                        comment.setAuthor("Excel Validator");
+                        cell.setCellComment(comment);
+
+                        System.out.println("Auto-filled column '" + colName + "' row " + (rowIndex + 1) + " with '" + defaultValue + "'");
+                    }
+                }
+            }
+        }
+
+        // --- END AUTO-FILL PASS ---
+
+        // Re-read the modified workbook data into memory for validation
+        Map<String, List<String>> columnData = new LinkedHashMap<>();
+        for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
+            Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+            String colName = headerCell.toString().trim();
+            if (colName.isEmpty()) {
+                colName = "Column_" + (colIndex + 1);
+            }
+
+            List<String> colValues = new ArrayList<>();
+            for (int rowIndex = 1; rowIndex <= lastDataRow; rowIndex++) {
+                Row row = sheetToProcess.getRow(rowIndex);
+                Cell cell = (row == null) ? null : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                String value = (cell == null) ? "" : dataFormatter.formatCellValue(cell, evaluator).trim();
+                colValues.add(value);
+            }
+            columnData.put(colName, colValues);
+        }
+
+        // Save the modified workbook content to the file storage service
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        workbook.write(outputStream);
+        String fileId = fileStorageService.storeFile(file.getOriginalFilename(), outputStream.toByteArray());
+
+        // Validate the re-read data
+        ExcelInfoResponse response = processDataAndValidate(columnData, sheetCount,
+                Collections.singletonList(sheetToProcess.getSheetName()), columnIndexMap, "xlsx");
+        response.setFileId(fileId);
+        response.setFileType("xlsx");
+        return response;
     }
 
     /**
@@ -236,10 +282,8 @@ public class ExcelService {
     }
 
     /**
-     * Generate Excel file with validation errors highlighted
-     *
-     * Now also auto-fills selected empty critical columns (inside dataset) with defaults,
-     * colors those auto-filled cells YELLOW and adds comment.
+     * Generate Excel file with validation errors highlighted in red.
+     * This method does NOT perform auto-fill or yellow highlighting anymore.
      */
     public byte[] generateErrorHighlightedExcel(String fileId) throws Exception {
         if (!fileStorageService.fileExists(fileId)) {
@@ -259,7 +303,6 @@ public class ExcelService {
 
             FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
             DataFormatter dataFormatter = new DataFormatter();
-            CreationHelper creationHelper = workbook.getCreationHelper();
 
             int sheetCount = workbook.getNumberOfSheets();
             Sheet sheetToRead = (sheetCount == 1) ? workbook.getSheetAt(0) : workbook.getSheet("Data");
@@ -278,10 +321,7 @@ public class ExcelService {
             Map<String, Integer> columnIndexMap = new LinkedHashMap<>();
 
             int maxColumns = headerRow.getLastCellNum();
-
-            // Determine last meaningful data row (ignore trailing empty rows)
             int lastDataRow = findLastNonEmptyRow(sheetToRead, maxColumns, dataFormatter, evaluator);
-            System.out.println("generateErrorHighlightedExcel - lastDataRow: " + lastDataRow);
 
             for (int colIndex = 0; colIndex < maxColumns; colIndex++) {
                 Cell headerCell = headerRow.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
@@ -289,110 +329,21 @@ public class ExcelService {
                 if (colName.isEmpty()) {
                     colName = "Column_" + (colIndex + 1);
                 }
-
                 columnIndexMap.put(colName, colIndex);
                 List<String> colValues = new ArrayList<>();
-
                 for (int rowIndex = 1; rowIndex <= lastDataRow; rowIndex++) {
                     Row row = sheetToRead.getRow(rowIndex);
                     Cell cell = (row == null) ? null : row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                    String value;
-                    if (cell == null) {
-                        value = "";
-                    } else {
-                        // For validation, always use the displayed value without special formatting
-                        value = dataFormatter.formatCellValue(cell, evaluator);
-                    }
-                    colValues.add(value == null ? "" : value.trim());
+                    String value = (cell == null) ? "" : dataFormatter.formatCellValue(cell, evaluator).trim();
+                    colValues.add(value);
                 }
                 columnData.put(colName, colValues);
             }
 
-            // --- AUTO-FILL pass: for selected critical columns, fill empty cells IN-DATASET with defaults ---
-            // Normalized names for the columns to auto-fill
-            Set<String> autoFillNormalized = new HashSet<>(Arrays.asList(
-                    normalizeForCompare("INTEREST RATE"),
-                    normalizeForCompare("PENAL RATE"),
-                    normalizeForCompare("PENAL CHARGE RATE"),
-                    normalizeForCompare("OPENING PRINCIPAL")
-            ));
-
-            // Prepare drawing & yellow style for auto-filled cells
-            Drawing<?> drawing = sheetToRead.createDrawingPatriarch();
-            CellStyle yellowStyle = workbook.createCellStyle();
-            yellowStyle.setFillForegroundColor(IndexedColors.YELLOW.getIndex());
-            yellowStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-
-            // Iterate columns and rows and apply auto-fill where applicable
-            for (Map.Entry<String, List<String>> entry : columnData.entrySet()) {
-                String colName = entry.getKey();
-                List<String> values = entry.getValue();
-                Integer colIndex = columnIndexMap.get(colName);
-                if (colIndex == null) continue;
-
-                String colNorm = normalizeForCompare(colName);
-                if (!autoFillNormalized.contains(colNorm)) continue; // not an auto-fill column
-
-                // Decide default depending on column type
-                boolean isOpeningPrincipal = normalizeForCompare("OPENING PRINCIPAL").equals(colNorm);
-                String defaultValue = isOpeningPrincipal ? "0.00" : "0%"; // default that matches validators
-
-                for (int j = 0; j < values.size(); j++) {
-                    String current = values.get(j);
-                    if (current == null || current.trim().isEmpty()) {
-                        // update the in-memory columnData so subsequent validation sees this value
-                        values.set(j, defaultValue);
-
-                        // update workbook cell (row in sheet is j+1 because header at 0)
-                        int excelRowIndex = j + 1; // 0-based row index in sheet (header at 0)
-                        Row row = sheetToRead.getRow(excelRowIndex);
-                        if (row == null) {
-                            row = sheetToRead.createRow(excelRowIndex);
-                        }
-                        Cell cell = row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
-                        // Set as string so DataFormatter displays exactly; if you prefer numeric percent/currency,
-                        // we'd need to set numeric value and adjust style — string is simpler and retains what user expects.
-                        cell.setCellValue(defaultValue);
-
-                        // Apply yellow style (clone existing style so we don't lose others)
-                        try {
-                            CellStyle newStyle = workbook.createCellStyle();
-                            if (cell.getCellStyle() != null) {
-                                newStyle.cloneStyleFrom(cell.getCellStyle());
-                            }
-                            newStyle.setFillForegroundColor(IndexedColors.YELLOW.getIndex());
-                            newStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-                            cell.setCellStyle(newStyle);
-                        } catch (Exception ex) {
-                            // fallback to the simple yellowStyle if cloning fails
-                            cell.setCellStyle(yellowStyle);
-                        }
-
-                        // Add comment explaining auto-fill
-                        ClientAnchor anchor = creationHelper.createClientAnchor();
-                        anchor.setCol1(colIndex);
-                        anchor.setCol2(colIndex + 3);
-                        anchor.setRow1(excelRowIndex);
-                        anchor.setRow2(excelRowIndex + 3);
-
-                        Comment comment = drawing.createCellComment(anchor);
-                        RichTextString richTextString = creationHelper.createRichTextString(
-                                "The cell was empty. Filled with default value 0"
-                        );
-                        comment.setString(richTextString);
-                        comment.setAuthor("Excel Validator");
-                        cell.setCellComment(comment);
-
-                        System.out.println("Auto-filled column '" + colName + "' row " + (excelRowIndex + 1) + " with '" + defaultValue + "'");
-                    }
-                }
-            }
-            // --- END AUTO-FILL pass ---
-
-            // Get detailed validation errors (after auto-fill, so auto-filled cells will validate OK)
+            // Get detailed validation errors (no auto-fill happens here)
             List<ValidationError> detailedErrors = getDetailedValidationErrors(columnData, columnIndexMap);
 
-            // Apply highlighting and comments for actual validation errors (red)
+            // Apply highlighting and comments for only validation errors (red)
             applyErrorHighlighting(workbook, sheetToRead, detailedErrors);
 
             // Write modified workbook to byte array
@@ -615,9 +566,9 @@ public class ExcelService {
      */
     private String normalizeForCompare(String s) {
         if (s == null) return "";
-        String cleaned = s.replaceAll("[^A-Za-z0-9 _ ]+", "")  // Keep only alphanumeric, spaces, and underscores
+        String cleaned = s.replaceAll("[^A-Za-z0-9 _]+", "") // Keep only alphanumeric, spaces, and underscores
                 .trim()
-                .replaceAll("\\s{2,}", " ")  // Collapse multiple spaces
+                .replaceAll("\\s{2,}", " ") // Collapse multiple spaces
                 .toLowerCase(Locale.ROOT);
         return cleaned;
     }
@@ -697,11 +648,11 @@ public class ExcelService {
      * Enhanced cell validation that collects all errors for a single cell
      *
      * Supported rule types:
-     *  - number   : numeric (accepts commas), floats like 0.02, 0.2833294
-     *  - percent  : requires trailing % e.g. 12.00% (validator expects % in the string)
-     *  - currency : numeric with commas allowed e.g. 86,000,000.00
-     *  - date     : validated with rule.format (SimpleDateFormat)
-     *  - text     : validated with regex if provided
+     * - number   : numeric (accepts commas), floats like 0.02, 0.2833294
+     * - percent  : requires trailing % e.g. 12.00% (validator expects % in the string)
+     * - currency : numeric with commas allowed e.g. 86,000,000.00
+     * - date     : validated with rule.format (SimpleDateFormat)
+     * - text     : validated with regex if provided
      */
     private void validateCellDetailed(String value, ColumnValidationRule rule, List<String> errors) {
         // Required check
