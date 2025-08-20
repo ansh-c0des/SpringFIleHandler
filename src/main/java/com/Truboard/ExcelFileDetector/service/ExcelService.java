@@ -24,6 +24,14 @@ import java.util.*;
  * rule-aware date formatting, and correct display-aware cell reading using
  * DataFormatter + FormulaEvaluator so percent signs and displayed date/currency
  * formats are preserved for validation.
+ *
+ * Added behavior:
+ * - Auto-fill empty cells inside dataset for critical columns:
+ *   INTEREST RATE, PENAL RATE, PENAL CHARGE RATE => auto-fill "0.00%"
+ *   OPENING PRINCIPAL => auto-fill "0.00"
+ * - Auto-filled cells are colored YELLOW and get a comment:
+ *   "The cell was empty. Filled with default value 0"
+ * - Auto-fill happens BEFORE re-validating, so auto-filled cells are valid.
  */
 @Service
 public class ExcelService {
@@ -229,6 +237,9 @@ public class ExcelService {
 
     /**
      * Generate Excel file with validation errors highlighted
+     *
+     * Now also auto-fills selected empty critical columns (inside dataset) with defaults,
+     * colors those auto-filled cells YELLOW and adds comment.
      */
     public byte[] generateErrorHighlightedExcel(String fileId) throws Exception {
         if (!fileStorageService.fileExists(fileId)) {
@@ -248,6 +259,7 @@ public class ExcelService {
 
             FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
             DataFormatter dataFormatter = new DataFormatter();
+            CreationHelper creationHelper = workbook.getCreationHelper();
 
             int sheetCount = workbook.getNumberOfSheets();
             Sheet sheetToRead = (sheetCount == 1) ? workbook.getSheetAt(0) : workbook.getSheet("Data");
@@ -296,10 +308,91 @@ public class ExcelService {
                 columnData.put(colName, colValues);
             }
 
-            // Get detailed validation errors
+            // --- AUTO-FILL pass: for selected critical columns, fill empty cells IN-DATASET with defaults ---
+            // Normalized names for the columns to auto-fill
+            Set<String> autoFillNormalized = new HashSet<>(Arrays.asList(
+                    normalizeForCompare("INTEREST RATE"),
+                    normalizeForCompare("PENAL RATE"),
+                    normalizeForCompare("PENAL CHARGE RATE"),
+                    normalizeForCompare("OPENING PRINCIPAL")
+            ));
+
+            // Prepare drawing & yellow style for auto-filled cells
+            Drawing<?> drawing = sheetToRead.createDrawingPatriarch();
+            CellStyle yellowStyle = workbook.createCellStyle();
+            yellowStyle.setFillForegroundColor(IndexedColors.YELLOW.getIndex());
+            yellowStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+            // Iterate columns and rows and apply auto-fill where applicable
+            for (Map.Entry<String, List<String>> entry : columnData.entrySet()) {
+                String colName = entry.getKey();
+                List<String> values = entry.getValue();
+                Integer colIndex = columnIndexMap.get(colName);
+                if (colIndex == null) continue;
+
+                String colNorm = normalizeForCompare(colName);
+                if (!autoFillNormalized.contains(colNorm)) continue; // not an auto-fill column
+
+                // Decide default depending on column type
+                boolean isOpeningPrincipal = normalizeForCompare("OPENING PRINCIPAL").equals(colNorm);
+                String defaultValue = isOpeningPrincipal ? "0.00" : "0%"; // default that matches validators
+
+                for (int j = 0; j < values.size(); j++) {
+                    String current = values.get(j);
+                    if (current == null || current.trim().isEmpty()) {
+                        // update the in-memory columnData so subsequent validation sees this value
+                        values.set(j, defaultValue);
+
+                        // update workbook cell (row in sheet is j+1 because header at 0)
+                        int excelRowIndex = j + 1; // 0-based row index in sheet (header at 0)
+                        Row row = sheetToRead.getRow(excelRowIndex);
+                        if (row == null) {
+                            row = sheetToRead.createRow(excelRowIndex);
+                        }
+                        Cell cell = row.getCell(colIndex, Row.MissingCellPolicy.CREATE_NULL_AS_BLANK);
+                        // Set as string so DataFormatter displays exactly; if you prefer numeric percent/currency,
+                        // we'd need to set numeric value and adjust style — string is simpler and retains what user expects.
+                        cell.setCellValue(defaultValue);
+
+                        // Apply yellow style (clone existing style so we don't lose others)
+                        try {
+                            CellStyle newStyle = workbook.createCellStyle();
+                            if (cell.getCellStyle() != null) {
+                                newStyle.cloneStyleFrom(cell.getCellStyle());
+                            }
+                            newStyle.setFillForegroundColor(IndexedColors.YELLOW.getIndex());
+                            newStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+                            cell.setCellStyle(newStyle);
+                        } catch (Exception ex) {
+                            // fallback to the simple yellowStyle if cloning fails
+                            cell.setCellStyle(yellowStyle);
+                        }
+
+                        // Add comment explaining auto-fill
+                        ClientAnchor anchor = creationHelper.createClientAnchor();
+                        anchor.setCol1(colIndex);
+                        anchor.setCol2(colIndex + 3);
+                        anchor.setRow1(excelRowIndex);
+                        anchor.setRow2(excelRowIndex + 3);
+
+                        Comment comment = drawing.createCellComment(anchor);
+                        RichTextString richTextString = creationHelper.createRichTextString(
+                                "The cell was empty. Filled with default value 0"
+                        );
+                        comment.setString(richTextString);
+                        comment.setAuthor("Excel Validator");
+                        cell.setCellComment(comment);
+
+                        System.out.println("Auto-filled column '" + colName + "' row " + (excelRowIndex + 1) + " with '" + defaultValue + "'");
+                    }
+                }
+            }
+            // --- END AUTO-FILL pass ---
+
+            // Get detailed validation errors (after auto-fill, so auto-filled cells will validate OK)
             List<ValidationError> detailedErrors = getDetailedValidationErrors(columnData, columnIndexMap);
 
-            // Apply highlighting and comments
+            // Apply highlighting and comments for actual validation errors (red)
             applyErrorHighlighting(workbook, sheetToRead, detailedErrors);
 
             // Write modified workbook to byte array
