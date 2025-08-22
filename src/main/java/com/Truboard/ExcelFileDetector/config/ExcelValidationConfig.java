@@ -50,7 +50,7 @@ public class ExcelValidationConfig {
         private int commentHeight = 3; // rows
 
         public String getBackgroundColor() {
-            return backgroundColor;
+            return backgroundColor;                                                                                          
         }
 
         public void setBackgroundColor(String backgroundColor) {
