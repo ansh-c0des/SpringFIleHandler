@@ -31,3 +31,60 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### General ###
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+### Java / Spring Boot ###
+target/
+build/
+out/
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+*.iml
+*.class
+*.jar
+*.war
+*.ear
+
+### Gradle ###
+.gradle/
+build/
+.gradle-cache/
+!gradle/wrapper/gradle-wrapper.jar
+
+### Maven ###
+log/
+*.mvn/
+.settings/
+.project
+.classpath
+
+### Node / Vite + React ###
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+### IDEs ###
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+### OS ###
+ehthumbs.db
+desktop.ini
+
