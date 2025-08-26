@@ -1,6 +1,26 @@
-version: '3.7'
+version: "3.8"
 
 services:
+  backend:
+    build:
+      context: ..
+      dockerfile: Dockerfile   
+    container_name: excel-backend
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build:
+      context: ../client/my-app
+      dockerfile: Dockerfile   
+    container_name: excel-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://backend:8080
+
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
