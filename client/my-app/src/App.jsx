@@ -2,74 +2,57 @@ import React, { useState } from 'react';
 
 // The main App component for the file upload UI.
 export default function App() {
-  // State to hold the selected file.
   const [file, setFile] = useState(null);
-  // State to hold the upload message (e.g., success, error).
   const [message, setMessage] = useState('');
-  // State to track the status (success, error, or neutral) for styling.
   const [status, setStatus] = useState('neutral');
 
-  /**
-   * Handles the change event when a file is selected.
-   * Updates the `file` state with the first selected file.
-   * Clears the previous message and status.
-   * @param {object} event - The file input change event.
-   */
   const handleFileChange = (event) => {
     setFile(event.target.files[0]);
     setMessage('');
     setStatus('neutral');
   };
 
-  /**
-   * Handles the file upload process.
-   * Sends a POST request to the specified API endpoint with the selected file.
-   */
   const handleUpload = async () => {
-    // Check if a file has been selected before attempting to upload.
     if (!file) {
       setMessage('Please select a file first.');
       setStatus('error');
       return;
     }
 
-    // Use FormData to prepare the file for the POST request.
     const formData = new FormData();
     formData.append('file', file);
 
+    // Use relative path so Nginx (in frontend container) can proxy to backend:
+    const targetUrl = `/api/excel/upload`;
+
     try {
-      // Perform the fetch request to the Spring Boot backend.
-      const response = await fetch('http://localhost:8080/api/excel/upload', {
+      const response = await fetch(targetUrl, {
         method: 'POST',
         body: formData,
       });
 
-      // Check the response status. A 200 status indicates success.
-      if (response.ok) { // `response.ok` is true for 200-299 status codes.
+      if (response.ok) {
         setMessage('Success! File uploaded successfully.');
         setStatus('success');
       } else {
-        // Handle non-200 responses, providing a specific error message.
-        const errorText = await response.text();
-        setMessage(`Error: ${response.status} - ${errorText}`);
+        const errText = await response.text().catch(() => '');
+        setMessage(`Error: ${response.status}${errText ? ' - ' + errText : ''}`);
         setStatus('error');
       }
     } catch (error) {
-      // Handle network errors or other exceptions during the fetch call.
       setMessage('An error occurred. Please check your network connection.');
       setStatus('error');
+      // console.error('Upload error', error);
     }
   };
 
   return (
-    // Tailwind classes for a centered, full-screen layout.
     <div className="flex items-center justify-center min-h-screen bg-gray-100 p-4">
       <div className="w-full max-w-md p-8 bg-white rounded-xl shadow-xl">
         <h1 className="text-2xl font-bold text-center mb-6 text-gray-800">
           File Uploader
         </h1>
 
-        {/* File input and upload button container */}
         <div className="flex flex-col space-y-4">
           <label className="block text-sm font-medium text-gray-700">
             Select a file to upload:
@@ -85,7 +68,6 @@ export default function App() {
               hover:file:bg-blue-100 cursor-pointer"
           />
 
-          {/* Display the selected file name */}
           {file && (
             <p className="text-sm text-gray-600">
               Selected file: <span className="font-semibold">{file.name}</span>
@@ -105,7 +87,6 @@ export default function App() {
           </button>
         </div>
 
-        {/* Message area to display upload status */}
         {message && (
           <div
             className={`p-4 mt-6 rounded-lg text-center font-medium
@@ -119,4 +100,3 @@ export default function App() {
     </div>
   );
 }
-
